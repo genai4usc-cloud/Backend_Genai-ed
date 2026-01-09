@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from services.script_generator import generate_script
-from core.azure_openai import supabase_client
+from core.config import supabase_client
 
 router = APIRouter(prefix="/lectures", tags=["lectures"])
 
