@@ -7,3 +7,6 @@ supabase
 httpx
 pypdf
 python-docx
+python-pptx
+Pillow
+lxml
