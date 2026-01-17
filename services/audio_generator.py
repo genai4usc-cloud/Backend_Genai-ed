@@ -1,15 +1,41 @@
+import re
+from xml.sax.saxutils import escape
+
 import httpx
 from supabase import create_client
-from core.config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
+
+from core.config import (
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    AZURE_SPEECH_KEY,
+    AZURE_SPEECH_REGION,
+)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+_TAG_RE = re.compile(r"<[^>]+>")  # strips any HTML/XML-like tags
+
+
+def _sanitize_for_ssml(text: str) -> str:
+    """
+    Makes text safe to embed inside SSML <voice>...</voice>.
+    - Removes HTML tags (e.g., <img>, <br>, etc.)
+    - Collapses whitespace
+    - Escapes XML special characters (&, <, >, quotes)
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    text = _TAG_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return escape(text, entities={'"': "&quot;", "'": "&apos;"})
 
 
 def _extract_audio_script(script_text: str) -> str:
     marker = "AUDIO SCRIPT:"
-    if marker in script_text:
+    if isinstance(script_text, str) and marker in script_text:
         return script_text.split(marker, 1)[1].strip()
-    return script_text.strip()
+    return (script_text or "").strip()
 
 
 async def generate_audio_tts_and_upload(
@@ -24,7 +50,7 @@ async def generate_audio_tts_and_upload(
     Returns:
         (public_url, storage_path)
     """
-    # ---- Validate inputs / config early (prevents confusing httpx header errors) ----
+    # ---- Validate config early ----
     if not isinstance(AZURE_SPEECH_KEY, str) or not AZURE_SPEECH_KEY.strip():
         raise RuntimeError(f"AZURE_SPEECH_KEY is missing/invalid (type={type(AZURE_SPEECH_KEY)})")
     if not isinstance(AZURE_SPEECH_REGION, str) or not AZURE_SPEECH_REGION.strip():
@@ -32,7 +58,17 @@ async def generate_audio_tts_and_upload(
 
     text = _extract_audio_script(script_text)
     if not text:
-        raise RuntimeError("No text found for audio generation")
+        raise RuntimeError("No text found for audio generation (AUDIO SCRIPT is empty)")
+
+    # SSML must be valid XML, and Azure has payload limits -> cap length
+    safe_text = _sanitize_for_ssml(text)[:8000]
+
+    # Build SSML without indentation that can cause weird parsing edge cases
+    ssml = f"""<speak version="1.0" xml:lang="en-US">
+<voice name="{voice_name}">
+{safe_text}
+</voice>
+</speak>"""
 
     tts_url = f"https://{AZURE_SPEECH_REGION.strip()}.tts.speech.microsoft.com/cognitiveservices/v1"
 
@@ -42,17 +78,8 @@ async def generate_audio_tts_and_upload(
         "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
         "User-Agent": "genai-ed-backend",
     }
-    # Ensure headers are always strings (httpx requirement)
+    # httpx requires all header values to be strings
     headers = {k: str(v) for k, v in headers.items() if v is not None}
-
-    # NOTE: Azure Speech expects valid SSML; we keep it simple and robust.
-    ssml = f"""
-<speak version="1.0" xml:lang="en-US">
-  <voice name="{voice_name}">
-    {text}
-  </voice>
-</speak>
-""".strip()
 
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(tts_url, headers=headers, content=ssml.encode("utf-8"))
@@ -61,7 +88,6 @@ async def generate_audio_tts_and_upload(
 
     storage_path = f"{educator_id}/{lecture_id}/artifacts/audio.mp3"
 
-    # Use file_options with x-upsert string to match your ppt/video uploads
     supabase.storage.from_("lecture-assets").upload(
         storage_path,
         audio_bytes,
