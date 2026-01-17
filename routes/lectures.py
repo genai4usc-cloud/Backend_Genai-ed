@@ -14,16 +14,24 @@ async def generate_lecture_script(lecture_id: str):
 
 @router.post("/{lecture_id}/generate-content")
 async def generate_lecture_content(lecture_id: str):
-    """
-    Stage 6:
-    - Reads script_text (generated in step 4)
-    - Reads avatar_character/avatar_style (step 5)
-    - Reads content_style array (step 3)
-    - Generates artifacts and writes to lecture_artifacts
-    - Updates lecture_jobs per type
-    """
     try:
         result = await generate_content_for_lecture(lecture_id)
+
+        if result is None:
+            raise HTTPException(
+                status_code=500,
+                detail="generate_content_for_lecture returned None (expected dict). Check content_generator flow/early returns."
+            )
+
+        if not isinstance(result, dict):
+            raise HTTPException(
+                status_code=500,
+                detail=f"generate_content_for_lecture returned {type(result)} (expected dict)."
+            )
+
         return {"status": "success", **result}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

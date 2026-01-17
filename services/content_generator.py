@@ -30,7 +30,6 @@ def _update_job(job_id: str, **fields):
 
 
 def _upsert_artifact(lecture_id: str, artifact_type: str, file_url: str, storage_path: str | None = None):
-    # keep both file_url + artifact_url to be safe with any older code/UI
     payload = {
         "lecture_id": lecture_id,
         "artifact_type": artifact_type,
@@ -44,7 +43,6 @@ def _upsert_artifact(lecture_id: str, artifact_type: str, file_url: str, storage
 
 
 async def generate_content_for_lecture(lecture_id: str):
-    # Load lecture config
     lecture = (
         supabase.table("lectures")
         .select("educator_id, content_style, script_text, avatar_character, avatar_style")
@@ -65,8 +63,10 @@ async def generate_content_for_lecture(lecture_id: str):
 
     jobs_to_run = []
 
+    # ✅ artifact_type must match frontend expectations:
+    # JOB_TO_ARTIFACT: audio -> "audio", pptx -> "pptx", video_avatar -> "video_avatar"
     if "audio" in content_style:
-        jobs_to_run.append(("audio", "audio_mp3"))
+        jobs_to_run.append(("audio", "audio"))  # ✅ was "audio_mp3"
 
     if "powerpoint" in content_style:
         jobs_to_run.append(("pptx", "pptx"))
@@ -74,13 +74,16 @@ async def generate_content_for_lecture(lecture_id: str):
     if "video" in content_style:
         if not avatar_character or not avatar_style:
             raise RuntimeError("Lecture missing avatar_character/avatar_style (Step 5).")
-        jobs_to_run.append(("video_avatar", "video_avatar_mp4"))
+        jobs_to_run.append(("video_avatar", "video_avatar"))  # ✅ was "video_avatar_mp4"
+
+    # ✅ recommended: fail fast if user selected nothing
+    if not jobs_to_run:
+        raise RuntimeError("No content_style selected. Choose at least one of: audio, powerpoint, video.")
 
     created_jobs = {}
     for job_type, _artifact_type in jobs_to_run:
         created_jobs[job_type] = _create_job(lecture_id, job_type)
 
-    # Run each job (sequential is simplest; you can parallelize later)
     for job_type, artifact_type in jobs_to_run:
         job = created_jobs[job_type]
         job_id = job["id"]
@@ -103,7 +106,7 @@ async def generate_content_for_lecture(lecture_id: str):
                     script_text=script_text,
                     avatar_character=avatar_character,
                     avatar_style=avatar_style,
-                    job_id=job_id,  # so the video generator can update progress while polling
+                    job_id=job_id,
                 )
                 _upsert_artifact(lecture_id, artifact_type, url, path)
 
@@ -112,13 +115,21 @@ async def generate_content_for_lecture(lecture_id: str):
         except Exception as e:
             _update_job(job_id, status="failed", progress=100, result={"error": str(e)}, error_message=str(e))
 
-    # If at least one artifact exists, mark lecture generated
     artifacts = (
         supabase.table("lecture_artifacts")
-        .select("id, file_url")
+        .select("id, artifact_type, file_url")
         .eq("lecture_id", lecture_id)
         .execute()
         .data
     )
-    if any(a.get("file_url") for a in artifacts):
+
+    has_any = any(a.get("file_url") for a in artifacts)
+    if has_any:
         supabase.table("lectures").update({"status": "generated"}).eq("id", lecture_id).execute()
+
+    return {
+        "lecture_id": lecture_id,
+        "jobs_created": list(created_jobs.keys()),
+        "has_any_artifact": has_any,
+        "artifacts": artifacts,
+    }

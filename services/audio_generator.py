@@ -63,8 +63,8 @@ async def generate_audio_tts_and_upload(
 
     # Use file_options with x-upsert string to match your ppt/video uploads
     supabase.storage.from_("lecture-assets").upload(
-        path=storage_path,
-        file=audio_bytes,
+        storage_path,
+        audio_bytes,
         file_options={
             "content-type": "audio/mpeg",
             "x-upsert": "true",
