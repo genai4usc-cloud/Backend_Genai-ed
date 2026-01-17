@@ -36,7 +36,7 @@ def _upsert_job(lecture_id: str, job_type: str, status: str, progress: int, resu
     )
     return inserted["id"]
 
-def _upsert_artifact(lecture_id: str, artifact_type: str, artifact_url: str):
+def _upsert_artifact(lecture_id: str, artifact_type: str, file_url: str):
     existing = (
         supabase.table("lecture_artifacts")
         .select("id")
@@ -47,12 +47,12 @@ def _upsert_artifact(lecture_id: str, artifact_type: str, artifact_url: str):
         .data
     )
     if existing and existing.get("id"):
-        supabase.table("lecture_artifacts").update({"artifact_url": artifact_url}).eq("id", existing["id"]).execute()
+        supabase.table("lecture_artifacts").update({"file_url": file_url}).eq("id", existing["id"]).execute()
         return existing["id"]
 
     inserted = (
         supabase.table("lecture_artifacts")
-        .insert({"lecture_id": lecture_id, "artifact_type": artifact_type, "artifact_url": artifact_url})
+        .insert({"lecture_id": lecture_id, "artifact_type": artifact_type, "file_url": file_url})
         .select("id")
         .single()
         .execute()
@@ -91,7 +91,7 @@ async def generate_content_for_lecture(lecture_id: str) -> dict:
                 script_text=script_text,
             )
             _upsert_artifact(lecture_id, "audio_mp3", url)
-            _upsert_job(lecture_id, "audio", "succeeded", 100, {"artifact_url": url})
+            _upsert_job(lecture_id, "audio", "succeeded", 100, {"file_url": url})
             outputs["audio_mp3"] = url
         except Exception as e:
             _upsert_job(lecture_id, "audio", "failed", 100, {"error": str(e)})
@@ -107,7 +107,7 @@ async def generate_content_for_lecture(lecture_id: str) -> dict:
                 script_text=script_text,
             )
             _upsert_artifact(lecture_id, "pptx", url)
-            _upsert_job(lecture_id, "pptx", "succeeded", 100, {"artifact_url": url})
+            _upsert_job(lecture_id, "pptx", "succeeded", 100, {"file_url": url})
             outputs["pptx"] = url
         except Exception as e:
             _upsert_job(lecture_id, "pptx", "failed", 100, {"error": str(e)})
@@ -125,10 +125,11 @@ async def generate_content_for_lecture(lecture_id: str) -> dict:
                 avatar_style=avatar_style,
             )
             _upsert_artifact(lecture_id, "video_avatar_mp4", url)
-            _upsert_job(lecture_id, "video_avatar", "succeeded", 100, {"artifact_url": url})
+            _upsert_job(lecture_id, "video_avatar", "succeeded", 100, {"file_url": url})
             outputs["video_avatar_mp4"] = url
         except Exception as e:
             _upsert_job(lecture_id, "video_avatar", "failed", 100, {"error": str(e)})
-            raise
+            # ✅ DO NOT raise — let audio/ppt succeed
+
 
     return {"lecture_id": lecture_id, "artifacts": outputs}

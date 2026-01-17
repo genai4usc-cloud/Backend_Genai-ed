@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from services.script_generator import generate_script
 from supabase import create_client
 from core.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+from services.content_generator import generate_content_for_lecture
 
 router = APIRouter(prefix="/lectures", tags=["lectures"])
 
@@ -31,7 +32,7 @@ async def generate_lecture_content(lecture_id: str):
         return {"status": "success", **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
+
 @router.get("/debug/supabase")
 def debug_supabase():
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
