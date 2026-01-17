@@ -16,6 +16,22 @@ async def generate_lecture_script(lecture_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/{lecture_id}/generate-content")
+async def generate_lecture_content(lecture_id: str):
+    """
+    Stage 6:
+    - Reads script_text (generated in step 4)
+    - Reads avatar_character/avatar_style (step 5)
+    - Reads content_style array (step 3)
+    - Generates artifacts and writes to lecture_artifacts
+    - Updates lecture_jobs per type
+    """
+    try:
+        result = await generate_content_for_lecture(lecture_id)
+        return {"status": "success", **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
 @router.get("/debug/supabase")
 def debug_supabase():
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
