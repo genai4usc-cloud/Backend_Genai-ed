@@ -1,135 +1,187 @@
+import asyncio
+from typing import Any, Dict, Optional
+
 from supabase import create_client
 from core.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+
 from services.audio_generator import generate_audio_tts_and_upload
 from services.ppt_generator import generate_pptx_and_upload
 from services.video_generator import generate_video_avatar_and_upload
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-def _upsert_job(lecture_id: str, job_type: str, status: str, progress: int, result: dict | None = None):
-    # If your lecture_jobs has a uniqueness constraint (lecture_id, job_type) you can upsert.
-    # If not, you can "select maybeSingle then update else insert".
-    existing = (
+
+def _first_row(resp) -> Optional[dict]:
+    """
+    supabase-py v2 returns an object with .data
+    We always take first row if present.
+    """
+    data = getattr(resp, "data", None)
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
+
+
+def _get_lecture(lecture_id: str) -> dict:
+    resp = (
+        supabase.table("lectures")
+        .select("id, educator_id, content_style, script_text, avatar_character, avatar_style, avatar_voice")
+        .eq("id", lecture_id)
+        .limit(1)
+        .execute()
+    )
+    lecture = _first_row(resp)
+    if not lecture:
+        raise RuntimeError(f"Lecture not found: {lecture_id}")
+    return lecture
+
+
+def _get_existing_job_id(lecture_id: str, job_type: str) -> Optional[str]:
+    resp = (
         supabase.table("lecture_jobs")
         .select("id")
         .eq("lecture_id", lecture_id)
         .eq("job_type", job_type)
-        .maybe_single()
+        .limit(1)
         .execute()
-        .data
     )
-    payload = {"status": status, "progress": progress}
-    if result is not None:
-        payload["result"] = result
+    row = _first_row(resp)
+    return row["id"] if row else None
 
-    if existing and existing.get("id"):
-        supabase.table("lecture_jobs").update(payload).eq("id", existing["id"]).execute()
-        return existing["id"]
 
-    inserted = (
-        supabase.table("lecture_jobs")
-        .insert({"lecture_id": lecture_id, "job_type": job_type, **payload})
-        .select("id")
-        .single()
-        .execute()
-        .data
-    )
-    return inserted["id"]
-
-def _upsert_artifact(lecture_id: str, artifact_type: str, file_url: str):
-    existing = (
+def _get_existing_artifact_id(lecture_id: str, artifact_type: str) -> Optional[str]:
+    resp = (
         supabase.table("lecture_artifacts")
         .select("id")
         .eq("lecture_id", lecture_id)
         .eq("artifact_type", artifact_type)
-        .maybe_single()
+        .limit(1)
         .execute()
-        .data
     )
-    if existing and existing.get("id"):
-        supabase.table("lecture_artifacts").update({"file_url": file_url}).eq("id", existing["id"]).execute()
-        return existing["id"]
+    row = _first_row(resp)
+    return row["id"] if row else None
 
-    inserted = (
-        supabase.table("lecture_artifacts")
-        .insert({"lecture_id": lecture_id, "artifact_type": artifact_type, "file_url": file_url})
-        .select("id")
-        .single()
-        .execute()
-        .data
-    )
-    return inserted["id"]
+
+def _upsert_job(lecture_id: str, job_type: str, patch: Dict[str, Any]) -> None:
+    """
+    Upsert lecture_jobs by (lecture_id, job_type) without relying on maybe_single().
+    """
+    existing_id = _get_existing_job_id(lecture_id, job_type)
+    if existing_id:
+        supabase.table("lecture_jobs").update(patch).eq("id", existing_id).execute()
+    else:
+        supabase.table("lecture_jobs").insert(
+            {"lecture_id": lecture_id, "job_type": job_type, **patch}
+        ).execute()
+
+
+def _upsert_artifact(lecture_id: str, artifact_type: str, patch: Dict[str, Any]) -> None:
+    """
+    Upsert lecture_artifacts by (lecture_id, artifact_type) without relying on maybe_single().
+    """
+    existing_id = _get_existing_artifact_id(lecture_id, artifact_type)
+    if existing_id:
+        supabase.table("lecture_artifacts").update(patch).eq("id", existing_id).execute()
+    else:
+        supabase.table("lecture_artifacts").insert(
+            {"lecture_id": lecture_id, "artifact_type": artifact_type, **patch}
+        ).execute()
+
 
 async def generate_content_for_lecture(lecture_id: str) -> dict:
-    lecture = (
-        supabase.table("lectures")
-        .select("id, script_text, content_style, avatar_character, avatar_style, educator_id")
-        .eq("id", lecture_id)
-        .single()
-        .execute()
-        .data
-    )
+    """
+    Main pipeline:
+    - reads lectures.content_style + script_text + avatar settings
+    - creates/updates lecture_jobs for each required output
+    - uploads artifacts and writes lecture_artifacts
+    """
+    lecture = _get_lecture(lecture_id)
 
-    script_text = lecture.get("script_text") or ""
-    if not script_text.strip():
-        raise RuntimeError("No script_text found. Generate script first (Step 4).")
-
-    styles = lecture.get("content_style") or []
     educator_id = lecture.get("educator_id")
-    avatar_character = lecture.get("avatar_character")
-    avatar_style = lecture.get("avatar_style")
+    content_style = lecture.get("content_style") or []
+    script_text = lecture.get("script_text") or ""
 
-    outputs = {}
+    if not educator_id:
+        raise RuntimeError("Lecture educator_id missing")
+    if not script_text.strip():
+        raise RuntimeError("Lecture script_text missing (generate script first)")
+
+    # Map style -> job_type + artifact_type
+    required = []
+    if "audio" in content_style:
+        required.append(("audio", "audio_mp3"))
+    if "powerpoint" in content_style:
+        required.append(("pptx", "pptx"))
+    if "video" in content_style:
+        required.append(("video_avatar", "video_avatar_mp4"))
+
+    # Create jobs as queued
+    for job_type, _artifact_type in required:
+        _upsert_job(
+            lecture_id,
+            job_type,
+            {"status": "queued", "progress": 0, "error_message": None, "result": {}},
+        )
+
+    results: Dict[str, Any] = {"lecture_id": lecture_id, "jobs": {}}
 
     # AUDIO
-    if "audio" in styles:
-        job_id = _upsert_job(lecture_id, "audio", "running", 15)
+    if ("audio", "audio_mp3") in required:
+        job_type, artifact_type = "audio", "audio_mp3"
+        _upsert_job(lecture_id, job_type, {"status": "running", "progress": 10})
+
         try:
-            url = await generate_audio_tts_and_upload(
-                lecture_id=lecture_id,
-                educator_id=educator_id,
-                script_text=script_text,
-            )
-            _upsert_artifact(lecture_id, "audio_mp3", url)
-            _upsert_job(lecture_id, "audio", "succeeded", 100, {"file_url": url})
-            outputs["audio_mp3"] = url
+            audio_url = await generate_audio_tts_and_upload(lecture_id, educator_id, script_text)
+            _upsert_artifact(lecture_id, artifact_type, {"file_url": audio_url})
+
+            _upsert_job(lecture_id, job_type, {"status": "succeeded", "progress": 100, "result": {}})
+            results["jobs"][job_type] = {"status": "succeeded", "url": audio_url}
         except Exception as e:
-            _upsert_job(lecture_id, "audio", "failed", 100, {"error": str(e)})
-            raise
+            # IMPORTANT: do NOT raise — allow pptx/video to continue
+            _upsert_job(
+                lecture_id,
+                job_type,
+                {"status": "failed", "progress": 100, "result": {"error": str(e)}, "error_message": None},
+            )
+            results["jobs"][job_type] = {"status": "failed", "error": str(e)}
 
     # PPTX
-    if "powerpoint" in styles:
-        job_id = _upsert_job(lecture_id, "pptx", "running", 15)
+    if ("pptx", "pptx") in required:
+        job_type, artifact_type = "pptx", "pptx"
+        _upsert_job(lecture_id, job_type, {"status": "running", "progress": 10})
+
         try:
-            url = await generate_pptx_and_upload(
-                lecture_id=lecture_id,
-                educator_id=educator_id,
-                script_text=script_text,
-            )
-            _upsert_artifact(lecture_id, "pptx", url)
-            _upsert_job(lecture_id, "pptx", "succeeded", 100, {"file_url": url})
-            outputs["pptx"] = url
-        except Exception as e:
-            _upsert_job(lecture_id, "pptx", "failed", 100, {"error": str(e)})
-            raise
+            pptx_url = await generate_pptx_and_upload(lecture_id, educator_id, script_text)
+            _upsert_artifact(lecture_id, artifact_type, {"file_url": pptx_url})
 
-    # VIDEO (Avatar)
-    if "video" in styles:
-        _upsert_job(lecture_id, "video_avatar", "running", 10)
+            _upsert_job(lecture_id, job_type, {"status": "succeeded", "progress": 100, "result": {}})
+            results["jobs"][job_type] = {"status": "succeeded", "url": pptx_url}
+        except Exception as e:
+            _upsert_job(
+                lecture_id,
+                job_type,
+                {"status": "failed", "progress": 100, "result": {"error": str(e)}, "error_message": None},
+            )
+            results["jobs"][job_type] = {"status": "failed", "error": str(e)}
+
+    # VIDEO AVATAR
+    if ("video_avatar", "video_avatar_mp4") in required:
+        job_type, artifact_type = "video_avatar", "video_avatar_mp4"
+        _upsert_job(lecture_id, job_type, {"status": "running", "progress": 10})
+
         try:
-            url = await generate_video_avatar_and_upload(
-                lecture_id=lecture_id,
-                educator_id=educator_id,
-                script_text=script_text,
-                avatar_character=avatar_character,
-                avatar_style=avatar_style,
-            )
-            _upsert_artifact(lecture_id, "video_avatar_mp4", url)
-            _upsert_job(lecture_id, "video_avatar", "succeeded", 100, {"file_url": url})
-            outputs["video_avatar_mp4"] = url
+            # Your video generator currently raises "Not implemented" — this will mark job failed but not stop others.
+            video_url = await generate_video_avatar_and_upload(lecture_id, educator_id, script_text)
+            _upsert_artifact(lecture_id, artifact_type, {"file_url": video_url})
+
+            _upsert_job(lecture_id, job_type, {"status": "succeeded", "progress": 100, "result": {}})
+            results["jobs"][job_type] = {"status": "succeeded", "url": video_url}
         except Exception as e:
-            _upsert_job(lecture_id, "video_avatar", "failed", 100, {"error": str(e)})
-            # ✅ DO NOT raise — let audio/ppt succeed
+            _upsert_job(
+                lecture_id,
+                job_type,
+                {"status": "failed", "progress": 100, "result": {"error": str(e)}, "error_message": None},
+            )
+            results["jobs"][job_type] = {"status": "failed", "error": str(e)}
 
-
-    return {"lecture_id": lecture_id, "artifacts": outputs}
+    return {"status": "started", **results}
