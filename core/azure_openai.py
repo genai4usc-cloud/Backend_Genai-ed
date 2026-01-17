@@ -7,7 +7,8 @@ from core.config import (
 )
 
 async def call_azure_openai(prompt: str) -> str:
-    url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+    endpoint = (AZURE_OPENAI_ENDPOINT or "").rstrip("/")
+    url = f"{endpoint}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
     params = {"api-version": AZURE_OPENAI_API_VERSION}
 
     headers = {
