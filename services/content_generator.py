@@ -63,10 +63,10 @@ async def generate_content_for_lecture(lecture_id: str):
 
     jobs_to_run = []
 
-    # ✅ artifact_type must match frontend expectations:
-    # JOB_TO_ARTIFACT: audio -> "audio", pptx -> "pptx", video_avatar -> "video_avatar"
+    # artifact_type must match frontend expectations:
+    # audio -> "audio", pptx -> "pptx", video_avatar -> "video_avatar"
     if "audio" in content_style:
-        jobs_to_run.append(("audio", "audio"))  # ✅ was "audio_mp3"
+        jobs_to_run.append(("audio", "audio"))
 
     if "powerpoint" in content_style:
         jobs_to_run.append(("pptx", "pptx"))
@@ -74,16 +74,17 @@ async def generate_content_for_lecture(lecture_id: str):
     if "video" in content_style:
         if not avatar_character or not avatar_style:
             raise RuntimeError("Lecture missing avatar_character/avatar_style (Step 5).")
-        jobs_to_run.append(("video_avatar", "video_avatar"))  # ✅ was "video_avatar_mp4"
+        jobs_to_run.append(("video_avatar", "video_avatar"))
 
-    # ✅ recommended: fail fast if user selected nothing
     if not jobs_to_run:
         raise RuntimeError("No content_style selected. Choose at least one of: audio, powerpoint, video.")
 
-    created_jobs = {}
+    # Create jobs and keep full inserted rows (so we can return job IDs to frontend)
+    created_jobs: dict[str, dict] = {}
     for job_type, _artifact_type in jobs_to_run:
         created_jobs[job_type] = _create_job(lecture_id, job_type)
 
+    # Run each job sequentially
     for job_type, artifact_type in jobs_to_run:
         job = created_jobs[job_type]
         job_id = job["id"]
@@ -106,15 +107,22 @@ async def generate_content_for_lecture(lecture_id: str):
                     script_text=script_text,
                     avatar_character=avatar_character,
                     avatar_style=avatar_style,
-                    job_id=job_id,
+                    job_id=job_id,  # so video generator can update progress while polling
                 )
                 _upsert_artifact(lecture_id, artifact_type, url, path)
 
             _update_job(job_id, status="succeeded", progress=100)
 
         except Exception as e:
-            _update_job(job_id, status="failed", progress=100, result={"error": str(e)}, error_message=str(e))
+            _update_job(
+                job_id,
+                status="failed",
+                progress=100,
+                result={"error": str(e)},
+                error_message=str(e),
+            )
 
+    # Fetch artifacts to return + optionally mark lecture generated
     artifacts = (
         supabase.table("lecture_artifacts")
         .select("id, artifact_type, file_url")
@@ -130,6 +138,7 @@ async def generate_content_for_lecture(lecture_id: str):
     return {
         "lecture_id": lecture_id,
         "jobs_created": list(created_jobs.keys()),
+        "job_ids": {job_type: job_row.get("id") for job_type, job_row in created_jobs.items()},
         "has_any_artifact": has_any,
         "artifacts": artifacts,
     }
