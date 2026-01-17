@@ -1,3 +1,4 @@
+import asyncio
 import re
 from xml.sax.saxutils import escape
 
@@ -13,86 +14,138 @@ from core.config import (
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-_TAG_RE = re.compile(r"<[^>]+>")  # strips any HTML/XML-like tags
+_TAG_RE = re.compile(r"<[^>]+>")
+API_VERSION = "2024-08-01"
+
+# Avatar endpoint is much more reliable with Jenny than Ava
+AVATAR_VOICE_NAME = "en-US-JennyMultilingualNeural"
 
 
 def _sanitize_for_ssml(text: str) -> str:
-    """
-    Makes text safe to embed inside SSML <voice>...</voice>.
-    - Removes HTML tags (e.g., <img>, <br>, etc.)
-    - Collapses whitespace
-    - Escapes XML special characters (&, <, >, quotes)
-    """
     if not isinstance(text, str):
         text = str(text)
-
     text = _TAG_RE.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return escape(text, entities={'"': "&quot;", "'": "&apos;"})
 
 
-def _extract_audio_script(script_text: str) -> str:
-    marker = "AUDIO SCRIPT:"
+def _extract_video_script(script_text: str) -> str:
+    marker = "VIDEO SCRIPT:"
     if isinstance(script_text, str) and marker in script_text:
-        return script_text.split(marker, 1)[1].strip()
+        return script_text.split(marker, 1)[1].split("AUDIO SCRIPT:", 1)[0].strip()
     return (script_text or "").strip()
 
 
-async def generate_audio_tts_and_upload(
-    lecture_id: str,
-    educator_id: str,
-    script_text: str,
-    voice_name: str = "en-US-AvaMultilingualNeural",
-) -> tuple[str, str]:
-    """
-    Generates TTS audio using Azure Speech and uploads to Supabase Storage.
-
-    Returns:
-        (public_url, storage_path)
-    """
-    # ---- Validate config early ----
-    if not isinstance(AZURE_SPEECH_KEY, str) or not AZURE_SPEECH_KEY.strip():
-        raise RuntimeError(f"AZURE_SPEECH_KEY is missing/invalid (type={type(AZURE_SPEECH_KEY)})")
-    if not isinstance(AZURE_SPEECH_REGION, str) or not AZURE_SPEECH_REGION.strip():
-        raise RuntimeError(f"AZURE_SPEECH_REGION is missing/invalid (type={type(AZURE_SPEECH_REGION)})")
-
-    text = _extract_audio_script(script_text)
-    if not text:
-        raise RuntimeError("No text found for audio generation (AUDIO SCRIPT is empty)")
-
-    # SSML must be valid XML, and Azure has payload limits -> cap length
+def _to_ssml(text: str) -> str:
     safe_text = _sanitize_for_ssml(text)[:8000]
-
-    # Build SSML without indentation that can cause weird parsing edge cases
-    ssml = f"""<speak version="1.0" xml:lang="en-US">
-<voice name="{voice_name}">
+    return f"""<speak version="1.0" xml:lang="en-US">
+<voice name="{AVATAR_VOICE_NAME}">
 {safe_text}
 </voice>
 </speak>"""
 
-    tts_url = f"https://{AZURE_SPEECH_REGION.strip()}.tts.speech.microsoft.com/cognitiveservices/v1"
+
+async def generate_video_avatar_and_upload(
+    lecture_id: str,
+    educator_id: str,
+    script_text: str,
+    avatar_character: str,
+    avatar_style: str,
+    job_id: str | None = None,
+) -> tuple[str, str]:
+    """
+    Creates Azure batch avatar synthesis, polls until done, downloads mp4, uploads to Supabase.
+
+    Returns:
+        (public_url, storage_path)
+    """
+    if not avatar_character or not avatar_style:
+        raise RuntimeError("Missing avatar_character/avatar_style (Step 5).")
+
+    if not isinstance(AZURE_SPEECH_KEY, str) or not AZURE_SPEECH_KEY.strip():
+        raise RuntimeError("AZURE_SPEECH_KEY is missing/invalid")
+    if not isinstance(AZURE_SPEECH_REGION, str) or not AZURE_SPEECH_REGION.strip():
+        raise RuntimeError("AZURE_SPEECH_REGION is missing/invalid")
+
+    text = _extract_video_script(script_text)
+    if not text:
+        raise RuntimeError("No text found for video generation (VIDEO SCRIPT is empty)")
+
+    # Must be 3-64 chars, letters/numbers/-/_, start+end with alnum
+    synthesis_id = f"{lecture_id}-avatar".replace("_", "-")[:64]
+    if not synthesis_id[-1].isalnum():
+        synthesis_id = synthesis_id.rstrip("-_") + "0"
+
+    base = f"https://{AZURE_SPEECH_REGION.strip()}.api.cognitive.microsoft.com"
+    put_url = f"{base}/avatar/batchsyntheses/{synthesis_id}?api-version={API_VERSION}"
+    get_url = f"{base}/avatar/batchsyntheses/{synthesis_id}?api-version={API_VERSION}"
 
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY.strip(),
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
-        "User-Agent": "genai-ed-backend",
+        "Content-Type": "application/json",
     }
-    # httpx requires all header values to be strings
-    headers = {k: str(v) for k, v in headers.items() if v is not None}
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(tts_url, headers=headers, content=ssml.encode("utf-8"))
+    payload = {
+        "inputKind": "SSML",
+        "inputs": [{"content": _to_ssml(text)}],
+        "avatarConfig": {
+            "talkingAvatarCharacter": avatar_character,
+            "talkingAvatarStyle": avatar_style,
+            "videoFormat": "Mp4",
+            "videoCodec": "h264",
+            "subtitleType": "none",
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.put(put_url, headers=headers, json=payload)
         r.raise_for_status()
-        audio_bytes = r.content
 
-    storage_path = f"{educator_id}/{lecture_id}/artifacts/audio.mp3"
+        running_ticks = 0
+        outputs_result_url = None
+
+        while True:
+            gr = await client.get(
+                get_url,
+                headers={"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY.strip()},
+            )
+            gr.raise_for_status()
+            data = gr.json()
+
+            status = data.get("status")
+
+            if status in ("Succeeded", "Failed"):
+                outputs = data.get("outputs") or {}
+                outputs_result_url = outputs.get("result")
+
+                if status == "Failed":
+                    raise RuntimeError(f"Azure avatar batch synthesis failed: {data}")
+                break
+
+            if job_id:
+                running_ticks += 1
+                approx = 50 + min(40, running_ticks * 5)
+                supabase.table("lecture_jobs").update({"progress": approx, "status": "running"}).eq("id", job_id).execute()
+
+            await asyncio.sleep(2)
+
+        if not outputs_result_url:
+            raise RuntimeError("Azure returned Succeeded but no outputs.result URL found")
+
+        vr = await client.get(
+            outputs_result_url,
+            headers={"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY.strip()},
+        )
+        vr.raise_for_status()
+        video_bytes = vr.content
+
+    storage_path = f"{educator_id}/{lecture_id}/artifacts/video_avatar.mp4"
 
     supabase.storage.from_("lecture-assets").upload(
         storage_path,
-        audio_bytes,
+        video_bytes,
         file_options={
-            "content-type": "audio/mpeg",
+            "content-type": "video/mp4",
             "x-upsert": "true",
         },
     )
